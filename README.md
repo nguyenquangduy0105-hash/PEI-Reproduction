@@ -11,5 +11,6 @@
 
 # ĐÁNH GIÁ METRICS :
 - Trong kết quả Reproduce (Chạy bằng phiên bảo beam search tự code), model trả ra kết quả FRR, PER, DER cao hơn nhiều so với Paper gốc, F1 thấp hơn paper gốc 6% và FAR lại thấp hơn nhiều so với paper gốc. Có thể model bias theo canonical sequence ít hơn, nhưng hallucinate nhiều hơn, hoặc model đang trả ra rất nhiều phoneme sai
+- Link đến bảng so sánh chi tiết : https://docs.google.com/document/d/1duOFT_tasYRWPHhkrJbxzOI_m7DY7o5-ACOSbzFchmI/edit?usp=sharing
 
 
