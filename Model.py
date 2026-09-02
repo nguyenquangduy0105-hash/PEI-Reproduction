@@ -79,9 +79,9 @@ import torch.nn as nn
 
 
 class canon_embed(nn.Module):
-    def __init__(self, phone, emb_dim, hidden_dim=768, pad_idx=0):
+    def __init__(self, phone, emb_dim, hidden_dim=768, pad_idx=68):
         super().__init__()
-        self.emb = nn.Embedding(phone+1, 64, padding_idx=pad_idx)
+        self.emb = nn.Embedding(phone+1, 768, padding_idx=pad_idx)
         self.bi_lstm = nn.LSTM(
             input_size=64,
             hidden_size=emb_dim // 2,
@@ -98,24 +98,16 @@ class canon_embed(nn.Module):
 
 
 class pei(nn.Module):
-    """
-    LƯU Ý QUAN TRỌNG: model KHÔNG còn tự load vocab.pkl bên trong nữa.
-    `phone` (số lượng phoneme) và `pad_idx` (id token [PAD]) PHẢI được truyền
-    tường minh từ bên ngoài (Trainer.py), vì mỗi thực nghiệm vocab khác nhau
-    sẽ có `phone` và `pad_idx` khác nhau. Việc hardcode/tự load vocab bên trong
-    Model.py sẽ khiến bạn không thể đổi vocab giữa các thực nghiệm mà không
-    sửa code — đây chính là điều bạn cần tránh khi so sánh 3 vocab.
-    """
 
-    def __init__(self, phone, pad_idx, hidden_dim=768):
+    def __init__(self, phone, pad_idx=68, hidden_dim=768):
         super().__init__()
-        self.canon_emb = canon_embed(phone=phone, emb_dim=hidden_dim, hidden_dim=hidden_dim, pad_idx=pad_idx)
+        self.canon_emb = nn.Embedding(phone, 768, padding_idx=pad_idx)
         self.mha1 = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=16, batch_first=True, dropout=0.2)
         self.mha2 = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=16, batch_first=True, dropout=0.2)
         self.ctc_proj = nn.Linear(768,phone)
         self.nll_proj = nn.Linear(768,2)
 
-    def forward(self, au_input, canon_input, w2v2, input_lengths=None, pad_idx=None):
+    def forward(self, au_input, canon_input, w2v2):
         X = w2v2(au_input)
         T = X.size(1)
         S = self.canon_emb(canon_input)

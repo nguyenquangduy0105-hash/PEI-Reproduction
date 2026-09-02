@@ -317,10 +317,8 @@ def save_checkpoint(
 
 def get_clean_sequence(tensor_ids, blank_token=0):
 
-    # Chuyển về list thuần túy
     ids = tensor_ids.tolist() if hasattr(tensor_ids, 'tolist') else list(tensor_ids)
 
-    # 1. Loại bỏ các token lặp liên tiếp
     collapsed = []
     if len(ids) > 0:
         collapsed.append(ids[0])
@@ -745,6 +743,7 @@ import math
 import pickle
 import random
 from typing import List, Tuple, Dict, Union
+import librosa
 
 import torch
 import torch.nn as nn
@@ -756,9 +755,6 @@ from transformers import Wav2Vec2Processor
 from scipy.io import wavfile
 from scipy.signal import resample_poly
 from tqdm import tqdm
-
-
-from pyctcdecode import build_ctcdecoder
 
 
 from Model import pei
@@ -782,43 +778,12 @@ def load_vocab(vocab_path):
     return p2idx, idx2p
 
 
-def resolve_special_ids(p2idx, blank_id=0):
-
-    if "[PAD]" not in p2idx:
-        raise KeyError("Vocab không có key '[PAD]' — kiểm tra lại file vocab.pkl")
-    pad_id = p2idx["[PAD]"]
-    return pad_id, blank_id
-
-
 # ============================================================
 # 2. DATASET
 # ============================================================
 
-def load_audio_without_torchaudio(path, target_sr=16000):
-    sr, waveform = wavfile.read(path + ".wav")
+processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-100h")
 
-    if waveform.ndim > 1:
-        waveform = waveform.mean(axis=1)
-
-    if waveform.dtype.kind in {"i", "u"}:
-        max_value = max(abs(float(waveform.min())), abs(float(waveform.max())), 1.0)
-        waveform = waveform.astype("float32") / max_value
-    else:
-        waveform = waveform.astype("float32")
-
-    if sr != target_sr:
-        gcd = math.gcd(sr, target_sr)
-        up = target_sr // gcd
-        down = sr // gcd
-        waveform = resample_poly(waveform, up, down).astype("float32")
-        sr = target_sr
-
-    waveform = torch.from_numpy(waveform).unsqueeze(0)
-
-    if torch.isnan(waveform).any() or torch.isinf(waveform).any():
-        waveform = torch.nan_to_num(waveform)
-
-    return waveform, sr
 
 
 def parse_sequence(value):
@@ -828,30 +793,37 @@ def parse_sequence(value):
 
 
 class pei_dataset(Dataset):
-    def __init__(self, data_path, processor=None):
+    def __init__(self, data_path):
         super().__init__()
         self.data = pd.read_csv(data_path)
-        self.processor = processor or Wav2Vec2Processor.from_pretrained(
-            "facebook/wav2vec2-base-100h"
-        )
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
         sample = self.data.iloc[idx]
-        path = sample["Path"]
-        waveform, sr = load_audio_without_torchaudio(path, target_sr=16000)
 
-        waveform_np = waveform.squeeze(0).numpy()
-        inputs = self.processor(waveform_np, sampling_rate=16000, return_tensors="pt")
-        input_values = inputs.input_values.squeeze(0)
+        waveform, sr = librosa.load(
+            sample["Path"] + ".wav",
+            sr=16000
+        )
 
-        transcript = torch.tensor(parse_sequence(sample["Transcript"]), dtype=torch.long)
-        canonical = torch.tensor(parse_sequence(sample["Canonical"]), dtype=torch.long)
-        error = torch.tensor(parse_sequence(sample["Error_GT"]), dtype=torch.long)
+        transcript = torch.tensor(
+            parse_sequence(sample["Transcript"]),
+            dtype=torch.long
+        )
 
-        return input_values, transcript, canonical, error
+        canonical = torch.tensor(
+            parse_sequence(sample["Canonical"]),
+            dtype=torch.long
+        )
+
+        error = torch.tensor(
+            parse_sequence(sample["Error_GT"]),
+            dtype=torch.long
+        )
+
+        return waveform, transcript, canonical, error
 
 
 def make_collate_fn(pad_idx):
@@ -862,16 +834,23 @@ def make_collate_fn(pad_idx):
         canonical = [item[2] for item in batch]
         error_gt = [item[3] for item in batch]
 
-        input_values_padded = pad_sequence(input_values, batch_first=True, padding_value=0.0)
+        max_len = max(len(x) for x in input_values)
+
+        input_values_padded = [np.pad(x,(0, max_len - len(x)),mode="constant",constant_values=0.0)for x in input_values]
+        input_values_norm = processor(
+            input_values_padded,
+            sampling_rate=16000,
+            return_tensors="pt"
+        ).input_values
         trans_padded = pad_sequence(transcript, batch_first=True, padding_value=pad_idx)
         canonical_padded = pad_sequence(canonical, batch_first=True, padding_value=pad_idx)
         error_gt_padded = pad_sequence(error_gt, batch_first=True, padding_value=2)
 
-        input_lengths = torch.LongTensor([s.size(0) for s in input_values])
-        label_lengths = torch.LongTensor([l.size(0) for l in transcript])
+        input_lengths = torch.LongTensor([len(s) for s in input_values])
+        label_lengths = torch.LongTensor([len(l) for l in transcript])
 
         return (
-            input_values_padded,
+            input_values_norm,
             trans_padded,
             canonical_padded,
             input_lengths,
@@ -912,56 +891,134 @@ def init_pei_weights(model):
 
 
 # ============================================================
-# 4. DECODE — greedy (dự phòng) + beam search (đúng như paper)
+# 4. DECODE
 # ============================================================
 
 class PhonemeDecoder:
-    def __init__(self, idx2p, p2idx, blank_id=0, beam_size=10):
+    def __init__(
+        self,
+        idx2p,
+        p2idx=None,
+        blank_id=68,
+        beam_size=10,
+        log_threshold=-20.0
+    ):
+        """
+        CTC Prefix Beam Search decoder.
+
+        Args:
+            idx2p:
+                dict: {id: phoneme}
+
+            p2idx:
+                dict: {phoneme: id}
+                Không bắt buộc, giữ lại để tương thích pipeline cũ.
+
+            blank_id:
+                ID của CTC blank token.
+
+            beam_size:
+                Số prefix được giữ lại sau mỗi timestep.
+
+            log_threshold:
+                Bỏ qua token có log probability thấp hơn giá trị này.
+                None = không pruning theo threshold.
+        """
+
         self.idx2p = idx2p
         self.p2idx = p2idx
+
         self.blank_id = blank_id
         self.beam_size = beam_size
+        self.log_threshold = log_threshold
 
-        # Xây dựng danh sách nhãn chuẩn theo đúng thứ tự index từ vocab
-        # Giống hệt cách repo gốc trích xuất danh sách nhãn cho pyctcdecode
-        max_idx = max(idx2p.keys()) if idx2p else 0
-        labels_list = [idx2p.get(i, "") for i in range(max_idx + 1)]
+    @staticmethod
+    def _logaddexp(a, b):
+        return np.logaddexp(a, b)
 
-        # Đảm bảo blank token hoặc các token đặc biệt không làm lệch index của pyctcdecode
-        # Khởi tạo ctc_decoder từ thư viện chuẩn
-        self.decoder_ctc = build_ctcdecoder(labels=labels_list)
+    def decode(self, log_probs, input_length=None):
+        if torch.is_tensor(log_probs):
+            log_probs = log_probs.detach().cpu().numpy()
 
-    def decode(self, log_probs_single):
-        """
-        Nhận vào log_probs_single dạng tensor hoặc numpy array (T, V)
-        hoặc (B, T, V) và thực thi giải mã bằng pyctcdecode.
-        """
-        if torch.is_tensor(log_probs_single):
-            log_probs = log_probs_single.detach().cpu().numpy()
-        else:
-            log_probs = log_probs_single
+        log_probs = np.asarray(log_probs)
 
-        # Nếu tensor truyền vào có dạng (1, T, V), bóp chiều batch lại
+
         if log_probs.ndim == 3:
-            log_probs = log_probs.squeeze(0)
 
-        # pyctcdecode yêu cầu đầu vào là xác suất dạng log-probabilities hoặc probabilities
-        # tuỳ cấu hình, ở đây ta truyền trực tiếp numpy array qua decoder chuẩn.
-        decoded_text = self.decoder_ctc.decode(log_probs)
+            if log_probs.shape[0] != 1:
+                raise ValueError(
+                    "PhonemeDecoder.decode() chỉ decode một sample. "
+                    f"Nhận shape {log_probs.shape}"
+                )
 
-        # Nếu từ decoder trả về dạng chuỗi văn bản/âm vị, ta map ngược lại thành list token IDs
-        # để MDDEvaluator xử lý đúng định dạng đầu vào.
-        # Hoặc nếu bạn muốn tách chuỗi theo khoảng trắng để lấy lại list token:
-        pred_tokens = []
-        for token_str in decoded_text.strip().split():
-            if token_str in self.p2idx:
-                pred_tokens.append(self.p2idx[token_str])
+            log_probs = log_probs[0]
+
+        if log_probs.ndim != 2:
+            raise ValueError(
+                f"log_probs phải có shape [T, V], nhận {log_probs.shape}"
+            )
+
+        if input_length is not None:
+
+            if torch.is_tensor(input_length):
+                input_length = input_length.detach().cpu().item()
+
+            input_length = int(input_length)
+
+            input_length = min(input_length, log_probs.shape[0])
+
+            log_probs = log_probs[:input_length]
+
+        T, V = log_probs.shape
+
+        NEG_INF = -float("inf")
+
+        beam = {(): (0.0, NEG_INF)}
+        for t in range(T):
+            next_beam = defaultdict(lambda: (NEG_INF, NEG_INF))
+
+            if self.log_threshold is not None:
+                active_tokens = np.where(log_probs[t] >= self.log_threshold)[0]
+
             else:
-                # Xử lý trường hợp ký tự lạ nếu có
-                if "[UNK]" in self.p2idx:
-                    pred_tokens.append(self.p2idx["[UNK]"])
+                active_tokens = range(V)
 
-        return pred_tokens
+            for c in active_tokens:
+                p_c = log_probs[t, c]
+                for prefix, (p_b, p_nb) in beam.items():
+                    p_total = np.logaddexp(p_b, p_nb)
+
+                    if c == self.blank_id:
+                        old_b, old_nb = next_beam[prefix]
+
+                        next_beam[prefix] = (np.logaddexp(old_b,p_total + p_c), old_nb)
+                        continue
+
+                    last_char = (prefix[-1]if len(prefix) > 0 else None)
+
+                    prefix_plus = prefix + (c,)
+
+                    old_b, old_nb = next_beam[prefix_plus]
+
+                    if c != last_char:
+
+                        next_beam[prefix_plus] = (old_b,np.logaddexp(old_nb,p_total + p_c))
+
+                    else:
+                        old_same_b, old_same_nb = next_beam[prefix]
+
+                        next_beam[prefix] = (old_same_b,np.logaddexp(old_same_nb, p_nb + p_c))
+                        old_plus_b, old_plus_nb = next_beam[prefix_plus]
+
+                        next_beam[prefix_plus] = (old_plus_b,np.logaddexp(old_plus_nb,p_b + p_c))
+
+            sorted_beam = sorted(next_beam.items(), key=lambda item: np.logaddexp(item[1][0], item[1][1]), reverse=True)
+
+            beam = dict(sorted_beam[:self.beam_size])
+
+        best_prefix, _ = max(beam.items(), key=lambda item: np.logaddexp(item[1][0], item[1][1]))
+
+        return list(best_prefix)
 
 
 # ============================================================
@@ -1103,14 +1160,11 @@ def train(model, iterator, device, criterion_ctc, criterion_nll, optimizer, w2v2
         label_length = label_length.to(device)
         error_gt = error_gt.to(device)
 
-        ctc_logits, nll_logits = model(waveform, canonical, w2v2, input_lengths=input_length, pad_idx=pad_id)
+        ctc_logits, nll_logits = model(waveform, canonical, w2v2)
 
         batch_size, max_T, _ = ctc_logits.shape
 
         ctc_probs = F.log_softmax(ctc_logits, dim=-1).transpose(0, 1)  # (T,B,C) cho CTCLoss
-        T = ctc_logits.shape[1]
-        #input_length_ctc = torch.clamp(input_length // 320, max=T)
-        #input_length = torch.full(size=(ctc_logits.shape[1],), fill_value=ctc_logits.shape[0], dtype=torch.long,device=device)
 
         input_length_ctc = torch.full(size=(batch_size,), fill_value=max_T, dtype=torch.long, device=device)
 
@@ -1143,15 +1197,12 @@ def validate(model, iterator, device, criterion_ctc, criterion_nll, w2v2, pad_id
             label_length = label_length.to(device)
             error_gt = error_gt.to(device)
 
-            ctc_logits, nll_logits = model(waveform, canonical, w2v2, input_lengths=input_length, pad_idx=pad_id)
+            ctc_logits, nll_logits = model(waveform, canonical, w2v2)
 
             batch_size, max_T, _ = ctc_logits.shape
             
             ctc_probs = F.log_softmax(ctc_logits, dim=-1).transpose(0, 1)
-            T = ctc_logits.shape[1]
-            #input_length_ctc = torch.clamp(input_length // 320, max=T)
-            #input_length = torch.full(size=(ctc_logits.shape[1],), fill_value=ctc_logits.shape[0], dtype=torch.long,device=device)
-            #nll_logits = F.log_softmax(nll_logits, dim=2)
+
             input_length_ctc = torch.full(size=(batch_size,), fill_value=max_T, dtype=torch.long, device=device)
 
             ctc_loss = criterion_ctc(ctc_probs, transcript, input_length_ctc, label_length.view(-1).long())
@@ -1179,7 +1230,7 @@ def evaluate(model, iterator, device, criterion_ctc, criterion_nll, w2v2, decode
             label_length = label_length.to(device)
             error_gt = error_gt.to(device)
 
-            ctc_logits, nll_logits = model(waveform, canonical, w2v2, input_lengths=input_length, pad_idx=pad_id)
+            ctc_logits, nll_logits = model(waveform, canonical, w2v2)
 
             batch_size, max_T, _ = ctc_logits.shape
             input_length_ctc = torch.full(size=(batch_size,), fill_value=max_T, dtype=torch.long, device=device)
@@ -1188,9 +1239,13 @@ def evaluate(model, iterator, device, criterion_ctc, criterion_nll, w2v2, decode
             ctc_probs_loss = F.log_softmax(ctc_logits, dim=-1).transpose(0, 1)   # (T,B,C) cho CTCLoss
             ctc_probs_decode = F.log_softmax(ctc_logits, dim=-1)                 # (B,T,C) cho decode từng sample
 
-            T = ctc_logits.shape[1]
-            #input_length_ctc = torch.clamp(input_length // 320, max=T)
-            #input_length = torch.full(size=(ctc_logits.shape[1],), fill_value=ctc_logits.shape[0], dtype=torch.long,device=device)
+
+            input_length_ctc = torch.full(
+                size=(batch_size,),
+                fill_value=max_T,
+                dtype=torch.long,
+                device=device
+            )
 
             batch_size = ctc_logits.size(0)
             for i in range(batch_size):
@@ -1198,7 +1253,7 @@ def evaluate(model, iterator, device, criterion_ctc, criterion_nll, w2v2, decode
                 single_transcript = [t for t in transcript[i].cpu().tolist() if t != pad_id]
                 single_canon = [t for t in canonical[i].cpu().tolist() if t != pad_id]
 
-                clean_output = decoder.decode(single_probs)
+                clean_output = decoder.decode(single_probs, input_length=input_length_ctc[i])
 
                 evaluator.update_sample(
                     canonical=single_canon,
@@ -1219,29 +1274,55 @@ def evaluate(model, iterator, device, criterion_ctc, criterion_nll, w2v2, decode
     return test_loss / max(1, len(iterator)), metrics
 
 
-def visualize_random_samples(model, dataset, device, idx2p, w2v2, decoder, pad_id, num_samples=5):
+def visualize_random_samples(
+    model, dataset, device, idx2p, w2v2, decoder, pad_id, num_samples=5
+):
     model.eval()
     indices = random.sample(range(len(dataset)), num_samples)
+
     print(f"\n--- VISUALIZING {num_samples} RANDOM SAMPLES ---")
 
     with torch.no_grad():
         for idx in indices:
             waveform, transcript, canon, _ = dataset[idx]
-            waveform = waveform.unsqueeze(0).to(device)
+
+            waveform = torch.from_numpy(waveform).unsqueeze(0).to(device)
             canon = canon.unsqueeze(0).to(device)
-            input_lengths = torch.LongTensor([waveform.size(1)]).to(device)
 
-            ctc_logits, _ = model(waveform, canon, w2v2, input_lengths=input_lengths, pad_idx=pad_id)
-            ctc_probs = F.log_softmax(ctc_logits, dim=-1)  # (1, T, C)
+            # Canonical
+            clean_canon = [str(idx2p[i.item()]) for i in canon[0]if i.item() != pad_id]
 
+            # Forward
+            ctc_logits, _ = model(waveform, canon, w2v2)
+
+            ctc_probs = F.log_softmax(ctc_logits, dim=-1)
+
+            # Decode
             pred_ids = decoder.decode(ctc_probs[0])
+
             clean_pred = [str(idx2p[i]) for i in pred_ids]
+
+            # Target / Transcript
             clean_target = [str(idx2p[t.item()]) for t in transcript if t.item() != pad_id]
 
             print(f"Sample index: {idx}")
+
+            print(f" > Canonical: {' '.join(clean_canon)}")
+            print(f" > Canonical length: {len(clean_canon)}")
+
             print(f" > Target: {' '.join(clean_target)}")
+            print(f" > Transcript length: {len(clean_target)}")
+
             print(f" > Output: {' '.join(clean_pred)}")
-            print("-" * 30)
+            print(f" > Output length: {len(clean_pred)}")
+
+            print(f" > Canonical → Transcript deletion: "
+                  f"{len(clean_canon) - len(clean_target)}")
+
+            print(f" > Transcript → Output deletion: "
+                  f"{len(clean_target) - len(clean_pred)}")
+
+            print("-" * 50)
 
 
 def save_checkpoint(model, optimizer, scheduler=None, loss=None, epoch=None,
@@ -1279,27 +1360,26 @@ def run_experiment(
 
     # --- vocab ---
     p2idx, idx2p = load_vocab(vocab_path)
-    pad_id, blank_id = resolve_special_ids(p2idx, blank_id=0)
+    pad_id = p2idx['<eps>']
+    blank_id = pad_id
     phone = len(p2idx)
     print(f"Vocab size: {phone} | pad_id={pad_id} (-> '{idx2p.get(pad_id, '?')}') "
           f"| blank_id={blank_id} (-> '{idx2p.get(blank_id, '?')}')")
-    print(">> Kiểm tra 2 dòng trên cho khớp ý định của bạn trước khi train!")
 
     # --- data ---
     shared_processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-100h")
-    train_dataset = pei_dataset(train_path, processor=shared_processor)
-    dev_dataset = pei_dataset(dev_path, processor=shared_processor)
-    test_dataset = pei_dataset(test_path, processor=shared_processor)
+    train_dataset = pei_dataset(train_path)
+    dev_dataset = pei_dataset(dev_path)
+    test_dataset = pei_dataset(test_path)
 
     collate_fn = make_collate_fn(pad_id)
-    train_loader = DataLoader(train_dataset, shuffle=True, num_workers=0,
-                               persistent_workers=False, collate_fn=collate_fn, batch_size=16)
-    dev_loader = DataLoader(dev_dataset, shuffle=False, num_workers=0,
-                             persistent_workers=False, collate_fn=collate_fn, batch_size=16)
-    test_loader = DataLoader(test_dataset, shuffle=False, num_workers=0,
-                              persistent_workers=False, collate_fn=collate_fn, batch_size=16)
+    train_loader = DataLoader(train_dataset, shuffle=True, num_workers=4,
+                               persistent_workers=True, collate_fn=collate_fn, batch_size=32, prefetch_factor=2)
+    dev_loader = DataLoader(dev_dataset, shuffle=False, num_workers=4,
+                             persistent_workers=True, collate_fn=collate_fn, batch_size=32,prefetch_factor=2)
+    test_loader = DataLoader(test_dataset, shuffle=False, num_workers=4,
+                              persistent_workers=True, collate_fn=collate_fn, batch_size=32,prefetch_factor=2)
 
-    # --- model / w2v2 (w2v2 đứng ngoài model, không train, không bị weight_init đụng tới) ---
     w2v2 = wav2vec2(target_layers=[9]).to(device)
     model = pei(phone=phone, pad_idx=pad_id).to(device)
     init_pei_weights(model)
@@ -1310,12 +1390,12 @@ def run_experiment(
     #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
     scheduler = None
 
-    #decoder = NativeCTCBeamSearch(idx2p, p2idx, blank_id=blank_id, beam_size=10)
     decoder = PhonemeDecoder(
         idx2p=idx2p,
         p2idx=p2idx,
         blank_id=blank_id,
-        beam_size=10
+        beam_size=10,
+        log_threshold=-20.0
     )
 
     best_loss = float("inf")
@@ -1327,6 +1407,7 @@ def run_experiment(
         train_loss = train(model, train_loader, device, criterion_ctc, criterion_nll, optimizer, w2v2, pad_id)
         dev_loss = validate(model, dev_loader, device, criterion_ctc, criterion_nll, w2v2, pad_id)
         #scheduler.step()
+        visualize_random_samples(model,test_dataset,device,idx2p, w2v2, decoder, pad_id, num_samples=2)
 
         print(f"[{name}] Train Loss: {train_loss:.4f} | Dev Loss: {dev_loss:.4f}")
 
@@ -1346,7 +1427,6 @@ def run_experiment(
         gc.collect()
         torch.cuda.empty_cache()
 
-    # --- load lại checkpoint tốt nhất trước khi visualize/eval cuối cùng ---
     ckpt_path = os.path.join(checkpoint_dir, "checkpoint.pth")
     if os.path.exists(ckpt_path):
         checkpoint = torch.load(ckpt_path, map_location=device)
@@ -1373,10 +1453,6 @@ def run_experiment(
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 2 thực nghiệm: mỗi cái có vocab_path RIÊNG và bộ CSV RIÊNG (vì Canonical/
-    # Transcript/Error_GT trong CSV được encode theo đúng vocab tương ứng —
-    # không được lẫn CSV của vocab này với vocab kia).
-    # Điền đúng đường dẫn CSV thật của bạn vào 6 dòng train/dev/test dưới đây.
     experiments = [
         dict(
             name="old_vocab",

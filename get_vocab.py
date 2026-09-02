@@ -24,14 +24,11 @@ for file in df:
             # Nếu phoneme được phân cách bằng khoảng trắng
             phonemes.update(text.split())
 
-# Sort để vocab có thứ tự cố định
 phonemes = sorted(phonemes)
 
-p2idx_new = {"":0,
-         '[PAD]':1}
-# Tạo mapping phoneme -> ID
+p2idx_new = {'<eps>':0}
 p2idx_new.update({
-    phoneme: idx+2
+    phoneme: idx+1
     for idx, phoneme in enumerate(phonemes)
 })
 
@@ -66,10 +63,9 @@ for df, output in [
 with open('vocab.json', 'r') as f:
     vocab = json.load(f)
 
-p2idx_old = {"":0,
-         '[PAD]':1}
+p2idx_old = {}
 
-p2idx_old.update({phoneme : idx+2 for phoneme,idx in vocab.items()})
+p2idx_old.update({phoneme : idx for phoneme,idx in vocab.items()})
 
 
 idx2p_old = {idx:p for p,idx in p2idx_old.items()}

@@ -7,7 +7,7 @@ class cfg:
     TEST_PATH_NEW = "test_with_error_new.csv"
     LR = 2e-5
     DECAY = 0
-    EPOCHS = 50
+    EPOCHS = 100
     PATIENCE = 5
     CHECKPOINT_DIR_OLD = "checkpoint_old"
     CHECKPOINT_DIR_NEW = "checkpoint_new"
